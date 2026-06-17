@@ -3,8 +3,9 @@ import sys
 import json
 import uuid
 import threading
+import logging
 from pathlib import Path
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -16,9 +17,13 @@ from s3_loader import S3ModelLoader
 from classifier import ImageClassifier
 from detector import ObjectDetector
 from speech_recognizer import SpeechRecognizer
-from video_processor import VideoProcessor
+from video_processor import VideoProcessor, ParallelVideoProcessor, PipelineConfig
 from vector_search import VectorSearchEngine
+from llm_corrector import BatchLLMCorrector
+from srt_generator import SRTGenerator
 
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
@@ -29,30 +34,32 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 RESULTS_DIR = BASE_DIR / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
-
 processing_tasks = {}
 search_engines = {}
 
 
 def initialize_models():
-    print("[INFO] Initializing models...")
+    logger.info("[INFO] Initializing models...")
     s3_loader = S3ModelLoader()
 
     class_model_path = os.getenv('CLASSIFICATION_MODEL', 'classification_model.onnx')
     det_model_path = os.getenv('DETECTION_MODEL', 'yolov8n.onnx')
     whisper_model = os.getenv('WHISPER_MODEL', 'base')
+    llm_model = os.getenv('LLM_MODEL', 'Qwen/Qwen2-7B-Instruct')
+    use_vllm = os.getenv('USE_VLLM', 'false').lower() == 'true'
+    vllm_url = os.getenv('VLLM_URL', 'http://localhost:8000')
 
     try:
         class_model = s3_loader.get_model_path(class_model_path)
     except FileNotFoundError:
         class_model = os.path.join(os.path.dirname(__file__), 'dummy.onnx')
-        print(f"[WARN] Classification model not found, will use mock mode")
+        logger.warning("[WARN] Classification model not found, will use mock mode")
 
     try:
         det_model = s3_loader.get_model_path(det_model_path)
     except FileNotFoundError:
         det_model = os.path.join(os.path.dirname(__file__), 'dummy_detect.onnx')
-        print(f"[WARN] Detection model not found, will use mock mode")
+        logger.warning("[WARN] Detection model not found, will use mock mode")
 
     use_gpu = os.getenv('USE_GPU', 'false').lower() == 'true'
 
@@ -65,7 +72,30 @@ def initialize_models():
         s3_loader=s3_loader
     )
 
-    processor = VideoProcessor(classifier, detector, speech_rec, frame_sample_rate=5)
+    llm_corrector = BatchLLMCorrector(
+        model_name=llm_model,
+        use_gpu=use_gpu,
+        use_vllm=use_vllm,
+        vllm_url=vllm_url
+    )
+
+    srt_generator = SRTGenerator(output_dir=str(RESULTS_DIR))
+
+    config = PipelineConfig(
+        frame_sample_rate=float(os.getenv('FRAME_SAMPLE_RATE', '5.0')),
+        vision_pool_size=int(os.getenv('VISION_POOL_SIZE', '2')),
+        enable_llm_correction=os.getenv('ENABLE_LLM_CORRECTION', 'true').lower() == 'true',
+        enable_srt_output=True
+    )
+
+    processor = ParallelVideoProcessor(
+        classifier=classifier,
+        detector=detector,
+        speech_recognizer=speech_rec,
+        llm_corrector=llm_corrector,
+        srt_generator=srt_generator,
+        config=config
+    )
 
     return processor
 
@@ -82,6 +112,15 @@ def health_check():
             "classifier": processor.classifier.model_loaded,
             "detector": processor.detector.model_loaded,
             "speech": processor.speech_recognizer.model_loaded
+        },
+        "llm_correction": {
+            "available": processor.llm_corrector is not None and processor.llm_corrector._model_loaded,
+            "enabled": processor.config.enable_llm_correction
+        },
+        "pipeline": {
+            "mode": processor.config.__class__.__name__,
+            "vision_pool_size": processor.config.vision_pool_size,
+            "frame_sample_rate": processor.config.frame_sample_rate
         }
     })
 
@@ -171,7 +210,10 @@ def get_task_status(task_id):
             response["result"] = {
                 "video_id": task["result"].get("video_id"),
                 "total_duration": task["result"].get("total_duration"),
-                "segment_count": task["result"].get("segment_count")
+                "segment_count": task["result"].get("segment_count"),
+                "srt_path": task["result"].get("srt_path"),
+                "llm_correction_applied": task["result"].get("llm_correction_applied"),
+                "pipeline_mode": task["result"].get("pipeline_mode")
             }
         return jsonify(response)
     return jsonify({"error": "Task not found"}), 404
@@ -217,6 +259,96 @@ def search_video():
     })
 
 
+@app.route('/api/subtitles/<video_id>', methods=['GET'])
+def get_subtitles(video_id):
+    fmt = request.args.get('format', 'srt')
+
+    if fmt == 'srt':
+        srt_path = RESULTS_DIR / f"{video_id}.srt"
+        if srt_path.exists():
+            return send_file(str(srt_path), mimetype='text/plain',
+                             as_attachment=True, download_name=f"{video_id}.srt")
+    elif fmt == 'vtt':
+        vtt_path = RESULTS_DIR / f"{video_id}.vtt"
+        if vtt_path.exists():
+            return send_file(str(vtt_path), mimetype='text/vtt',
+                             as_attachment=True, download_name=f"{video_id}.vtt")
+    elif fmt == 'json':
+        json_path = RESULTS_DIR / f"{video_id}_subtitles.json"
+        if json_path.exists():
+            with open(json_path, 'r', encoding='utf-8') as f:
+                return jsonify(json.load(f))
+
+    result_path = RESULTS_DIR / f"{video_id}.json"
+    if result_path.exists():
+        with open(result_path, 'r', encoding='utf-8') as f:
+            result = json.load(f)
+        speech_segments = result.get("speech_segments", [])
+        if speech_segments:
+            srt_gen = SRTGenerator(output_dir=str(RESULTS_DIR))
+            srt_path = srt_gen.generate_from_segments(speech_segments, video_id)
+            if fmt == 'srt' and os.path.exists(srt_path):
+                return send_file(srt_path, mimetype='text/plain',
+                                 as_attachment=True, download_name=f"{video_id}.srt")
+
+    return jsonify({"error": "Subtitles not found"}), 404
+
+
+@app.route('/api/correct', methods=['POST'])
+def correct_transcription():
+    data = request.json
+    video_id = data.get('video_id')
+    segments = data.get('segments')
+    context = data.get('context', '')
+
+    if video_id:
+        result_path = RESULTS_DIR / f"{video_id}.json"
+        if not result_path.exists():
+            return jsonify({"error": "Video result not found"}), 404
+        with open(result_path, 'r', encoding='utf-8') as f:
+            result = json.load(f)
+        segments = result.get("speech_segments", [])
+        if not segments:
+            return jsonify({"error": "No speech segments found for this video"}), 404
+    elif not segments:
+        return jsonify({"error": "Either video_id or segments must be provided"}), 400
+
+    if processor.llm_corrector is None:
+        return jsonify({"error": "LLM corrector not available"}), 503
+
+    try:
+        corrected = processor.llm_corrector.correct_segments(segments, context)
+
+        correction_stats = {
+            "total_segments": len(corrected),
+            "corrected_segments": sum(1 for s in corrected if s.get("corrected", False)),
+            "unchanged_segments": sum(1 for s in corrected if not s.get("corrected", False))
+        }
+
+        if video_id:
+            result_path = RESULTS_DIR / f"{video_id}.json"
+            with open(result_path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+            result["speech_segments"] = corrected
+
+            srt_gen = SRTGenerator(output_dir=str(RESULTS_DIR))
+            srt_path = srt_gen.generate_from_segments(corrected, video_id)
+            result["srt_path"] = srt_path
+
+            with open(result_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+
+        return jsonify({
+            "video_id": video_id,
+            "corrected_segments": corrected,
+            "stats": correction_stats
+        })
+
+    except Exception as e:
+        logger.error(f"[ERROR] LLM correction failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/uploads/<filename>')
 def serve_upload(filename):
     return send_from_directory(str(UPLOAD_DIR), filename)
@@ -224,5 +356,7 @@ def serve_upload(filename):
 
 if __name__ == '__main__':
     port = int(os.getenv('PYTHON_PORT', 5000))
-    print(f"[INFO] Starting Python backend on port {port}")
+    logger.info(f"[INFO] Starting Python backend on port {port}")
+    logger.info(f"[INFO] Pipeline: parallel_gstreamer | Vision pool: {processor.config.vision_pool_size}")
+    logger.info(f"[INFO] LLM correction: {'enabled' if processor.config.enable_llm_correction else 'disabled'}")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

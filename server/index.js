@@ -193,6 +193,44 @@ app.get('/api/videos/:video_id', async (req, res) => {
   }
 });
 
+app.get('/api/subtitles/:video_id', async (req, res) => {
+  try {
+    const fmt = req.query.format || 'srt';
+    const pyRes = await axios.get(
+      `${PYTHON_URL}/api/subtitles/${req.params.video_id}?format=${fmt}`,
+      { responseType: fmt === 'json' ? 'json' : 'stream' }
+    );
+
+    if (fmt === 'json') {
+      res.json(pyRes.data);
+    } else {
+      const ext = fmt === 'vtt' ? 'vtt' : 'srt';
+      res.setHeader('Content-Type', fmt === 'vtt' ? 'text/vtt' : 'text/plain');
+      res.setHeader('Content-Disposition', `attachment; filename="${req.params.video_id}.${ext}"`);
+      pyRes.data.pipe(res);
+    }
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      res.status(404).json({ error: '字幕文件未找到' });
+    } else {
+      console.error('[SUBTITLES ERROR]', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+app.post('/api/correct', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/correct`, req.body);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[CORRECT ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
 app.post('/api/search', async (req, res) => {
   try {
     const pyRes = await axios.post(`${PYTHON_URL}/api/search`, req.body);
