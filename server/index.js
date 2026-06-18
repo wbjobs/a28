@@ -44,6 +44,7 @@ const upload = multer({
 });
 
 const activeTasks = new Map();
+const activeLiveStreams = new Map();
 
 app.use('/uploads', express.static(UPLOAD_DIR));
 
@@ -251,6 +252,154 @@ app.post('/api/search', async (req, res) => {
   }
 });
 
+app.post('/api/clip/search', upload.single('video'), async (req, res) => {
+  try {
+    let videoPath = req.body.video_path;
+
+    if (req.file && !videoPath) {
+      videoPath = req.file.path;
+    }
+
+    if (!videoPath) {
+      return res.status(400).json({ error: 'video_path or video file required' });
+    }
+
+    const payload = {
+      video_path: videoPath,
+      top_k: parseInt(req.body.top_k) || 5,
+      exclude_id: req.body.exclude_id,
+      threshold: parseFloat(req.body.threshold) || 0.3
+    };
+
+    const pyRes = await axios.post(`${PYTHON_URL}/api/clip/search`, payload);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[CLIP SEARCH ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
+app.post('/api/clip/search_frame', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/clip/search_frame`, req.body);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[CLIP SEARCH FRAME ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
+app.post('/api/clip/index', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/clip/index`, req.body);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[CLIP INDEX ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
+app.get('/api/summary/:video_id', async (req, res) => {
+  try {
+    const pyRes = await axios.get(`${PYTHON_URL}/api/summary/${req.params.video_id}`);
+    res.json(pyRes.data);
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      res.status(404).json({ error: '摘要未找到' });
+    } else {
+      console.error('[SUMMARY ERROR]', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+app.post('/api/summary/generate', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/summary/generate`, req.body);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[SUMMARY GENERATE ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
+app.post('/api/live/start', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/live/start`, req.body);
+    const streamId = pyRes.data.stream_id;
+
+    activeLiveStreams.set(streamId, {
+      stream_id: streamId,
+      rtmp_url: req.body.rtmp_url,
+      started_at: new Date().toISOString()
+    });
+
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[LIVE START ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
+app.post('/api/live/stop/:stream_id', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/live/stop/${req.params.stream_id}`);
+    activeLiveStreams.delete(req.params.stream_id);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[LIVE STOP ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
+app.get('/api/live/status', async (req, res) => {
+  try {
+    const pyRes = await axios.get(`${PYTHON_URL}/api/live/status`);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[LIVE STATUS ERROR]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/live/status/:stream_id', async (req, res) => {
+  try {
+    const pyRes = await axios.get(`${PYTHON_URL}/api/live/status/${req.params.stream_id}`);
+    res.json(pyRes.data);
+  } catch (err) {
+    if (err.response && err.response.status === 404) {
+      res.status(404).json({ error: '直播流未找到' });
+    } else {
+      console.error('[LIVE STATUS ERROR]', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  }
+});
+
+app.post('/api/privacy/detect', async (req, res) => {
+  try {
+    const pyRes = await axios.post(`${PYTHON_URL}/api/privacy/detect`, req.body);
+    res.json(pyRes.data);
+  } catch (err) {
+    console.error('[PRIVACY DETECT ERROR]', err.response ? err.response.data : err.message);
+    res.status(500).json({
+      error: err.response ? err.response.data.error : err.message
+    });
+  }
+});
+
 app.get('/api/videos', (req, res) => {
   try {
     const videos = [];
@@ -294,6 +443,7 @@ wss.on('connection', (ws) => {
   console.log('[WS] Client connected');
 
   let pollInterval;
+  let livePollIntervals = new Map();
 
   ws.on('message', async (message) => {
     try {
@@ -324,6 +474,43 @@ wss.on('connection', (ws) => {
       if (data.type === 'stop_poll') {
         if (pollInterval) clearInterval(pollInterval);
       }
+
+      if (data.type === 'poll_live' && data.stream_id) {
+        const intervalMs = data.interval_ms || 2000;
+        const liveInterval = setInterval(async () => {
+          try {
+            const pyRes = await axios.get(
+              `${PYTHON_URL}/api/live/status/${data.stream_id}`,
+              { timeout: 3000 }
+            );
+            ws.send(JSON.stringify({
+              type: 'live_update',
+              stream_id: data.stream_id,
+              data: pyRes.data
+            }));
+
+            if (['stopped', 'ended', 'error'].includes(pyRes.data.status)) {
+              clearInterval(liveInterval);
+              livePollIntervals.delete(data.stream_id);
+            }
+          } catch (err) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: err.message,
+              stream_id: data.stream_id
+            }));
+          }
+        }, intervalMs);
+        livePollIntervals.set(data.stream_id, liveInterval);
+      }
+
+      if (data.type === 'stop_live_poll' && data.stream_id) {
+        const liveInterval = livePollIntervals.get(data.stream_id);
+        if (liveInterval) {
+          clearInterval(liveInterval);
+          livePollIntervals.delete(data.stream_id);
+        }
+      }
     } catch (e) {
       console.error('[WS] Invalid message:', e.message);
     }
@@ -331,6 +518,10 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (pollInterval) clearInterval(pollInterval);
+    for (const [sid, interval] of livePollIntervals) {
+      clearInterval(interval);
+    }
+    livePollIntervals.clear();
     console.log('[WS] Client disconnected');
   });
 });
